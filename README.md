@@ -21,4 +21,5 @@ Procesar datos en formato JSON desde una base pública (Kaggle), simular la lleg
 ## Dataset de origen
 
 Para obtener los datos se emplea el dataset de Kaggle: 
+
 🔗 https://www.kaggle.com/datasets/rohit265/rossmann-retail-sales-and-store-performance-data

@@ -8,15 +8,15 @@ Procesar datos en formato JSON desde una base pública (Kaggle), simular la lleg
 
 ## Componentes
 
-    Pub/Sub: Canal de entrada para mensajes de ventas.
+Pub/Sub: Canal de entrada para mensajes de ventas.
 
-    Dataflow (Apache Beam): Limpieza, validación y transformación.
+Dataflow (Apache Beam): Limpieza, validación y transformación.
 
-    BigQuery: Almacenamiento final para análisis.
+BigQuery: Almacenamiento final para análisis.
 
-    Cloud Build / GitHub Actions: CI/CD para despliegue del pipeline.
+Cloud Build / GitHub Actions: CI/CD para despliegue del pipeline.
 
-    Entornos separados: Configuración para dev y prod.
+Entornos separados: Configuración para dev y prod.
 
 ## Dataset de origen
 

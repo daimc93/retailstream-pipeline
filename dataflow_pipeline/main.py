@@ -1,30 +1,47 @@
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
+from apache_beam.transforms.window import FixedWindows
+from apache_beam.transforms.trigger import AfterProcessingTime, AccumulationMode, AfterWatermark
 import json
+import logging
 
+
+
+# Función personalizada para limpiar y validar mensajes
 class CleanAndTransformFn(beam.DoFn):
     def process(self, element):
         try:
+            # Decode del mensaje desde Pub/Sub y parseo del JSON
             record = json.loads(element.decode("utf-8"))
-            
-            if record.get("quantity", 0) <= 0 or record.get("unit_price", 0.0) <= 0:
-                return
-            
-            record["quantity"] = int(record["quantity"])
-            record["unit_price"] = int(record["unit_price"])
-            record["total_amount"] = int(record["total_amount"])
-            
-            if "timestamp" not in record:
-                return
-            
-            record["payment_type"] = record["payment_type"].title()
-            record["channel"] = record["channel"].capitalize()
-            
-            yield record
-        except Exception as e:
-            print(f"Error procesando mensaje: {e}")
-            return
 
+            # Validación de campos obligatorios
+            required_fields = ["transaction_id", "store_id", "timestamp", "quantity", "unit_price", "total_amount"]
+            for field in required_fields:
+                if record.get(field) in [None, "", "null"]:
+                    logging.warning(f"Campo faltante o nulo: {field}")
+                    return  # No emitir este mensaje
+
+            # Validación de valores numéricos razonables
+            if int(record["quantity"]) <= 0 or float(record["unit_price"]) <= 0:
+                logging.warning("Cantidad o precio inválido.")
+                return
+
+            # Limpieza y transformación
+            record["quantity"] = int(record["quantity"])
+            record["unit_price"] = float(record["unit_price"])
+            record["total_amount"] = float(record["total_amount"])
+            record["payment_type"] = record.get("payment_type", "").title()
+            record["channel"] = record.get("channel", "").capitalize()
+
+            # Emitimos el mensaje limpio
+            yield record
+
+        except Exception as e:
+            logging.error(f"Error en limpieza: {e}")
+            return  # Silenciosamente ignora si falla el parseo
+
+
+# Definición del esquema de BigQuery
 SCHEMA = {
     "fields": [
         {"name": "transaction_id", "type": "STRING"},
@@ -42,29 +59,43 @@ SCHEMA = {
 }
 
 def run():
+    # Configuración de opciones para Dataflow
     options = PipelineOptions(
         runner = 'DataflowRunner',
         project = 'PROJECT_ID', # retailstream-dev
         region = 'REGION',
-        temp_location = 'gs://retailstream-dev-temp/temp/',
+        temp_location = 'gs://retailstream-dev-temp/temp/', # Bucket de GCS para archivos temporales
         streamin = True
     )
     
-    p = beam.Pipeline(options=options)
-    
-    (
-        p
-        | 'Leer de PubSub' >> beam.io.ReadFromPubSub(topic = 'projects/PROJECT_ID/topics/sales-stream')
-        | 'Limpiar y Transformar' >> beam.ParDo(CleanAndTransformFn())
-        | 'Escribir en BigQuery' >> beam.io.WriteToBigQuery(
-            table = 'retail_data.transactions',
-            schema = SCHEMA,
-            write_disposition = beam.io.BigueryDisposition.WRITE_APPEND,
-            create_disposition = beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+    # Definición del pipeline 
+    with beam.Pipeline(options=options) as p:
+        (
+            p
+            # Leer de Pub/Sub directamente desde el tópico
+            | 'Leer de PubSub' >> beam.io.ReadFromPubSub(
+                topic='projects/retailstream-dev/topics/sales-stream'
+            )
+
+            # Agrupar los datos en ventanas fijas de 1 minuto 
+            | 'Ventana fija de 1 min' >> beam.WindowInto(
+                FixedWindows(60),  # ventanas de 60 segundos
+                trigger=AfterWatermark(late=AfterProcessingTime(60)),  # espera hasta watermark o 60s
+                accumulation_mode=AccumulationMode.DISCARDING  # no acumula datos antiguos
+            )
+
+            # Limpiar y transformar
+            | 'Limpiar y transformar' >> beam.ParDo(CleanAndTransformFn())
+
+            # Escribir a BigQuery
+            | 'Escribir en BigQuery' >> beam.io.WriteToBigQuery(
+                table='retail_data.transactions',
+                schema=SCHEMA,
+                write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
+                create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+            )
         )
-    )
-    
-    p.run()
-    
+
 if __name__ == '__main__':
+    logging.getLogger().setLevel(logging.INFO)
     run()

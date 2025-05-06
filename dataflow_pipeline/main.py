@@ -1,47 +1,83 @@
 import apache_beam as beam
-from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
+from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.transforms.window import FixedWindows
 from apache_beam.transforms.trigger import AfterProcessingTime, AccumulationMode, AfterWatermark
+import apache_beam.transforms.window as window
 import json
 import logging
+from datetime import datetime
 
+# Etiquetas para las salidas principales y de error
+class OutputTags:
+    VALID = 'valid'
+    ERROR = 'error'
 
-
-# Función personalizada para limpiar y validar mensajes
+# Funcion para limpiar, transformar y enrutar los datos
 class CleanAndTransformFn(beam.DoFn):
     def process(self, element):
         try:
-            # Decode del mensaje desde Pub/Sub y parseo del JSON
-            record = json.loads(element.decode("utf-8"))
+            decoded = element.decode("utf-8")
+            record = json.loads(decoded)
 
-            # Validación de campos obligatorios
+            # Validar campos obligatorios
             required_fields = ["transaction_id", "store_id", "timestamp", "quantity", "unit_price", "total_amount"]
             for field in required_fields:
                 if record.get(field) in [None, "", "null"]:
-                    logging.warning(f"Campo faltante o nulo: {field}")
-                    return  # No emitir este mensaje
+                    yield beam.pvalue.TaggedOutput(OutputTags.ERROR, {
+                        "error_type": "Dato incompleto",
+                        "error_message": f"Falta el campo obligatorio: {field}",
+                        "raw_message": decoded,
+                        "error_timestamp": datetime.utcnow().isoformat() + "Z"
+                    })
+                    return
 
-            # Validación de valores numéricos razonables
-            if int(record["quantity"]) <= 0 or float(record["unit_price"]) <= 0:
-                logging.warning("Cantidad o precio inválido.")
+            # Validación de tipo y rango
+            try:
+                record["quantity"] = int(record["quantity"])
+                record["unit_price"] = float(record["unit_price"])
+                record["total_amount"] = float(record["total_amount"])
+            except ValueError as e:
+                yield beam.pvalue.TaggedOutput(OutputTags.ERROR, {
+                    "error_type": "Tipo incorrecto",
+                    "error_message": f"Error de conversión: {e}",
+                    "raw_message": decoded,
+                    "error_timestamp": datetime.utcnow().isoformat() + "Z"
+                })
                 return
 
-            # Limpieza y transformación
-            record["quantity"] = int(record["quantity"])
-            record["unit_price"] = float(record["unit_price"])
-            record["total_amount"] = float(record["total_amount"])
+            if record["quantity"] <= 0 or record["unit_price"] <= 0:
+                yield beam.pvalue.TaggedOutput(OutputTags.ERROR, {
+                    "error_type": "Fuera de rango",
+                    "error_message": f"Cantidad o precio inválido: {record['quantity']} / {record['unit_price']}",
+                    "raw_message": decoded,
+                    "error_timestamp": datetime.utcnow().isoformat() + "Z"
+                })
+                return
+
+            # Normalización
             record["payment_type"] = record.get("payment_type", "").title()
             record["channel"] = record.get("channel", "").capitalize()
 
-            # Emitimos el mensaje limpio
-            yield record
+            # Emitimos si es válido
+            yield beam.pvalue.TaggedOutput(OutputTags.VALID, record)
+
+        except json.JSONDecodeError as e:
+            yield beam.pvalue.TaggedOutput(OutputTags.ERROR, {
+                "error_type": "JSON mal formado",
+                "error_message": str(e),
+                "raw_message": element.decode("utf-8", errors="ignore"),
+                "error_timestamp": datetime.utcnow().isoformat() + "Z"
+            })
 
         except Exception as e:
-            logging.error(f"Error en limpieza: {e}")
-            return  # Silenciosamente ignora si falla el parseo
+            yield beam.pvalue.TaggedOutput(OutputTags.ERROR, {
+                "error_type": "Error desconocido",
+                "error_message": str(e),
+                "raw_message": element.decode("utf-8", errors="ignore"),
+                "error_timestamp": datetime.utcnow().isoformat() + "Z"
+            })
 
-
-# Definición del esquema de BigQuery
+# Esquema para BigQuery: eventos validos
 SCHEMA = {
     "fields": [
         {"name": "transaction_id", "type": "STRING"},
@@ -58,39 +94,86 @@ SCHEMA = {
     ]
 }
 
+# Esquema para errores
+ERROR_SCHEMA = {
+    "fields": [
+        {"name": "error_type", "type": "STRING"},
+        {"name": "error_message", "type": "STRING"},
+        {"name": "raw_message", "type": "STRING"},
+        {"name": "error_timestamp", "type": "TIMESTAMP"}
+    ]
+}
+
+# Esquema para resumen de ventas por tienda y ventana
+SUMMARY_SCHEMA = {
+    "fields": [
+        {"name": "store_id", "type": "INTEGER"},
+        {"name": "window_start", "type": "TIMESTAMP"},
+        {"name": "window_end", "type": "TIMESTAMP"},
+        {"name": "total_sales", "type": "FLOAT"},
+        {"name": "transaction_count", "type": "INTEGER"}
+    ]
+}
+
+# Formatear resultados agrupados
+def format_summary(store_id, values, window):
+    total_sales = sum(v['total_amount'] for v in values)
+    transaction_count = len(values)
+    return {
+        "store_id": store_id,
+        "window_start": window.start.to_utc_datetime().isoformat(),
+        "window_end": window.end.to_utc_datetime().isoformat(),
+        "total_sales": round(total_sales, 2),
+        "transaction_count": transaction_count
+    }
+
 def run():
-    # Configuración de opciones para Dataflow
     options = PipelineOptions(
-        runner = 'DataflowRunner',
-        project = 'PROJECT_ID', # retailstream-dev
-        region = 'REGION',
-        temp_location = 'gs://retailstream-dev-temp/temp/', # Bucket de GCS para archivos temporales
-        streamin = True
+        runner='DataflowRunner',
+        project='retailstream-dev',
+        region='us-central1',
+        temp_location='gs://retailstream-dev-temp/temp/',
+        streaming=True
     )
-    
-    # Definición del pipeline 
+
     with beam.Pipeline(options=options) as p:
-        (
+        # Leer y enrutar mensajes válidos y con error
+        messages = (
             p
-            # Leer de Pub/Sub directamente desde el tópico
-            | 'Leer de PubSub' >> beam.io.ReadFromPubSub(
-                topic='projects/retailstream-dev/topics/sales-stream'
+            | 'Leer de PubSub' >> beam.io.ReadFromPubSub(topic='projects/retailstream-dev/topics/sales-stream')
+            | 'Procesar mensajes' >> beam.ParDo(CleanAndTransformFn()).with_outputs(OutputTags.VALID, OutputTags.ERROR, main=OutputTags.VALID)
+        )
+
+        # Eventos válidos → BigQuery (detalle)
+        messages.valid | 'Guardar válidos en BQ' >> beam.io.WriteToBigQuery(
+            table='retail_data.transactions',
+            schema=SCHEMA,
+            write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
+            create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+        )
+
+        # Errores → BigQuery
+        messages.error | 'Guardar errores en BQ' >> beam.io.WriteToBigQuery(
+            table='retail_data.transactions_errors',
+            schema=ERROR_SCHEMA,
+            write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
+            create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+        )
+
+        # Agregación por tienda cada 1 min
+        (
+            messages.valid
+            | 'Agrupar por tienda' >> beam.Map(lambda x: (x["store_id"], x))
+            | 'Ventana de 1 minuto' >> beam.WindowInto(
+                window.FixedWindows(60),
+                trigger=AfterWatermark(late=AfterProcessingTime(60)),
+                accumulation_mode=AccumulationMode.DISCARDING
             )
-
-            # Agrupar los datos en ventanas fijas de 1 minuto 
-            | 'Ventana fija de 1 min' >> beam.WindowInto(
-                FixedWindows(60),  # ventanas de 60 segundos
-                trigger=AfterWatermark(late=AfterProcessingTime(60)),  # espera hasta watermark o 60s
-                accumulation_mode=AccumulationMode.DISCARDING  # no acumula datos antiguos
-            )
-
-            # Limpiar y transformar
-            | 'Limpiar y transformar' >> beam.ParDo(CleanAndTransformFn())
-
-            # Escribir a BigQuery
-            | 'Escribir en BigQuery' >> beam.io.WriteToBigQuery(
-                table='retail_data.transactions',
-                schema=SCHEMA,
+            | 'GroupByKey' >> beam.GroupByKey()
+            | 'Formatear resumen' >> beam.MapTuple(format_summary)
+            | 'Guardar resumen en BQ' >> beam.io.WriteToBigQuery(
+                table='retail_data.sales_summary',
+                schema=SUMMARY_SCHEMA,
                 write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
                 create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
             )

@@ -1,0 +1,6 @@
+{
+  "project_id": "retailstream-dev",
+  "region": "us-central1",
+  "temp_bucket": "retailstream-dev-temp",
+  "topic": "sales-stream"
+}

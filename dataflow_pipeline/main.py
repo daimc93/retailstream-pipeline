@@ -6,6 +6,8 @@ import apache_beam.transforms.window as window
 import json
 import logging
 from datetime import datetime
+import argparse
+import os
 
 # Etiquetas para las salidas principales y de error
 class OutputTags:
@@ -115,7 +117,7 @@ SUMMARY_SCHEMA = {
     ]
 }
 
-# Calcular el total de ventas y cantidad de transacciones en una ventana de 1 minuto.
+# Formatear resultados agrupados
 def format_summary(store_id, values, window):
     total_sales = sum(v['total_amount'] for v in values)
     transaction_count = len(values)
@@ -128,11 +130,20 @@ def format_summary(store_id, values, window):
     }
 
 def run():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', help='Ruta al archivo de configuración JSON')
+    args, beam_args = parser.parse_known_args()
+
+    # Cargar config
+    with open(args.config, 'r') as f:
+        config = json.load(f)
+
+    # Opciones de ejecución para Dataflow
     options = PipelineOptions(
         runner='DataflowRunner',
-        project='retailstream-dev',
-        region='us-central1',
-        temp_location='gs://retailstream-dev-temp/temp/',
+        project=config["project_id"],
+        region=config["region"],
+        temp_location=f"gs://{config['temp_bucket']}/temp/",
         streaming=True
     )
 
@@ -140,7 +151,7 @@ def run():
         # Leer y enrutar mensajes válidos y con error
         messages = (
             p
-            | 'Leer de PubSub' >> beam.io.ReadFromPubSub(topic='projects/retailstream-dev/topics/sales-stream')
+            | 'Leer de PubSub' >> beam.io.ReadFromPubSub(topic=f"projects/{config['project_id']}/topics/{config['topic']}")
             | 'Procesar mensajes' >> beam.ParDo(CleanAndTransformFn()).with_outputs(OutputTags.VALID, OutputTags.ERROR, main=OutputTags.VALID)
         )
 

@@ -13,13 +13,17 @@ Pub/Sub: Canal de entrada para mensajes de ventas.
 Dataflow (Apache Beam): Limpieza, validación y transformación.
 
 BigQuery: Almacenamiento final para análisis.
+   - Transacciones válidas (`transactions`)
+   - Errores (`transactions_errors`)
+   - Agregados por tienda y minuto (`sales_summary`)
 
-Cloud Build / GitHub Actions: CI/CD para despliegue del pipeline.
+GitHub Actions: CI/CD para despliegue del pipeline.
 
 Entornos separados: Configuración para dev y prod.
 
-## Dataset de origen
 
-Para obtener los datos se emplea el dataset de Kaggle: 
 
-🔗 https://www.kaggle.com/datasets/rohit265/rossmann-retail-sales-and-store-performance-data
+
+
+
+

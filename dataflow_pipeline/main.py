@@ -115,7 +115,7 @@ SUMMARY_SCHEMA = {
     ]
 }
 
-# Formatear resultados agrupados
+# Calcular el total de ventas y cantidad de transacciones en una ventana de 1 minuto.
 def format_summary(store_id, values, window):
     total_sales = sum(v['total_amount'] for v in values)
     transaction_count = len(values)
